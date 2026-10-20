@@ -1,0 +1,500 @@
+"""15-Asset Allocation Terminal  –  Streamlit dashboard
+Edit the CONFIG section to use your own instruments / dates / targets."""
+import json
+import os
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from scipy.optimize import minimize
+
+st.set_page_config(page_title="Portfolio Terminal", page_icon="📈", layout="wide")
+
+# ============================================================== CONFIG
+INVEST_DATE = pd.Timestamp("2026-08-31")
+TARGET_DATE = pd.Timestamp("2029-08-31")
+CORPUS = 1e7                      # ₹1 crore per persona
+LOOKBACK_YEARS = 5
+BENCH = "^NSEI"
+MAX_WEIGHT = 0.15                 # per-instrument cap in optimiser
+TD = 252
+
+PERSONAS = {
+    "Aggressive": dict(
+        target=2.25e7, file="inception_holdings_aggressive.json",
+        alloc={"Equity": .80, "Debt": .10, "Gold": .06, "Silver": .04},
+        bands={"Equity": (.65, .90), "Debt": (.05, .20), "Gold": (.02, .10), "Silver": (.02, .10)}),
+    "Moderate": dict(
+        target=2.00e7, file="inception_holdings.json",
+        alloc={"Equity": .65, "Debt": .20, "Gold": .09, "Silver": .06},
+        bands={"Equity": (.50, .80), "Debt": (.10, .35), "Gold": (.05, .15), "Silver": (.02, .10)}),
+    "Conservative": dict(
+        target=1.75e7, file="inception_holdings_conservative.json",
+        alloc={"Equity": .50, "Debt": .35, "Gold": .10, "Silver": .05},
+        bands={"Equity": (.35, .65), "Debt": (.20, .55), "Gold": (.05, .20), "Silver": (.02, .10)}),
+}
+
+# cls: Equity / Debt / Gold / Silver.  ticker=None -> priced at par (G-Sec) with accrued coupon.
+INSTRUMENTS = [
+    dict(name="Indian Bank", ticker="INDIANB.NS", cls="Equity", sector="Banking", cap="Large Cap"),
+    dict(name="Lloyds Metals & Energy", ticker="LLOYDSME.NS", cls="Equity", sector="Metals", cap="Large Cap"),
+    dict(name="TVS Motor Company", ticker="TVSMOTOR.NS", cls="Equity", sector="Auto", cap="Large Cap"),
+    dict(name="National Aluminium Co (NALCO)", ticker="NATIONALUM.NS", cls="Equity", sector="Metals", cap="Mid Cap"),
+    dict(name="Chennai Petroleum Corp", ticker="CHENNPETRO.NS", cls="Equity", sector="Energy", cap="Small Cap"),
+    dict(name="Hindustan Aeronautics (HAL)", ticker="HAL.NS", cls="Equity", sector="Defence", cap="Large Cap"),
+    dict(name="Oil India", ticker="OIL.NS", cls="Equity", sector="Energy", cap="Mid Cap"),
+    dict(name="Force Motors", ticker="FORCEMOT.NS", cls="Equity", sector="Auto", cap="Small Cap"),
+    dict(name="BSE Ltd.", ticker="BSE.NS", cls="Equity", sector="Capital Markets", cap="Large Cap"),
+    dict(name="Apar Industries", ticker="APARINDS.NS", cls="Equity", sector="Electricals", cap="Mid Cap"),
+    dict(name="Mazagon Dock Shipbuilders", ticker="MAZDOCK.NS", cls="Equity", sector="Defence", cap="Large Cap"),
+    dict(name="6.03% GOI G-Sec 2029", ticker=None, cls="Debt", sector="Government Bond", cap="-", income=0.0603),
+    dict(name="BHARAT Bond ETF April 2031", ticker="EBBETF0431.NS", cls="Debt", sector="Bond ETF", cap="-", income=0.07),
+    dict(name="Nippon India ETF Gold BeES", ticker="GOLDBEES.NS", cls="Gold", sector="Gold", cap="-"),
+    dict(name="Nippon India Silver ETF", ticker="SILVERBEES.NS", cls="Silver", sector="Silver", cap="-"),
+]
+NAMES = [i["name"] for i in INSTRUMENTS]
+CLASS = {i["name"]: i["cls"] for i in INSTRUMENTS}
+GSEC = next(i for i in INSTRUMENTS if i["ticker"] is None)
+GOLD, TEAL, RED, GREEN = "#b08a2e", "#3a7d87", "#b3261e", "#2e7d32"
+
+# ============================================================== STYLE
+st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@500;700&display=swap');
+h1,h2,h3,.serif {{font-family:'Source Serif 4',Georgia,serif !important;}}
+.card {{background:#fafbfc;border:1px solid #e3e6ea;border-radius:10px;padding:16px 20px;margin-bottom:10px}}
+.card .lbl {{font-size:.85rem;color:#555}} .card .val {{font-family:'Source Serif 4',Georgia,serif;font-size:1.9rem;font-weight:700;color:#1b2333}}
+.card .sub {{font-size:.85rem}} .eyebrow {{color:{GOLD};font-size:.8rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase}}
+.warn {{background:#f8f6e4;color:#7a5c00;border-radius:8px;padding:14px 18px;margin:10px 0}}
+.sel {{border:1.5px solid {GOLD};background:#fffdf5}}
+</style>""", unsafe_allow_html=True)
+
+
+def card(label, value, sub="", color="#555", cls=""):
+    return (f"<div class='card {cls}'><div class='lbl'>{label}</div><div class='val'>{value}</div>"
+            f"<div class='sub' style='color:{color}'>{sub}</div></div>")
+
+
+def cr(x):  return f"₹{x/1e7:.2f} Cr"
+def lakh(x): return f"₹{x/1e5:.2f} L"
+def sgn(x, f): return ("-" if x < 0 else "") + f(abs(x))
+
+
+# ============================================================== DATA
+@st.cache_data(ttl=900, show_spinner="Fetching market data…")
+def load_prices():
+    tk = [i["ticker"] for i in INSTRUMENTS if i["ticker"]] + [BENCH]
+    start = pd.Timestamp.today() - pd.DateOffset(years=LOOKBACK_YEARS)
+    df = yf.download(tk, start=start, auto_adjust=False, progress=False)["Close"]
+    if isinstance(df, pd.Series):
+        df = df.to_frame(tk[0])
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df.ffill()
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching dividends…")
+def load_dividends():
+    out = {}
+    for i in INSTRUMENTS:
+        if not i["ticker"]:
+            continue
+        try:
+            s = yf.Ticker(i["ticker"]).dividends
+            s.index = pd.to_datetime(s.index).tz_localize(None)
+            out[i["name"]] = s[s.index > INVEST_DATE]
+        except Exception:
+            out[i["name"]] = pd.Series(dtype=float)
+    return out
+
+
+@st.cache_data(ttl=86400)
+def load_caps():
+    out = {}
+    for i in INSTRUMENTS:
+        try:
+            out[i["name"]] = yf.Ticker(i["ticker"]).fast_info["market_cap"] / 1e7 if i["ticker"] else np.nan
+        except Exception:
+            out[i["name"]] = np.nan
+    return out
+
+
+raw = load_prices()
+if raw.empty:
+    st.error("No market data returned. Check tickers / internet.")
+    st.stop()
+tmap = {i["ticker"]: i["name"] for i in INSTRUMENTS if i["ticker"]}
+bench = raw[BENCH].dropna() if BENCH in raw else pd.Series(dtype=float)
+prices = raw.rename(columns=tmap).drop(columns=[BENCH], errors="ignore")
+prices[GSEC["name"]] = 100.0                                   # G-Sec carried at par
+prices = prices.reindex(columns=NAMES)
+missing = [n for n in NAMES if prices[n].dropna().empty]
+if missing:
+    st.warning(f"No price data for: {', '.join(missing)} (check ticker)")
+divs, caps = load_dividends(), load_caps()
+TODAY = prices.index[-1]
+last, prev = prices.ffill().iloc[-1], prices.ffill().iloc[-2]
+
+
+# ============================================================== SNAPSHOTS (frozen inception holdings)
+def entry_price(name):
+    s = prices[name].dropna().loc[INVEST_DATE:]
+    return float(s.iloc[0]) if len(s) else float(prices[name].dropna().iloc[-1])
+
+
+def get_snapshot(persona):
+    cfg = PERSONAS[persona]
+    if os.path.exists(cfg["file"]):
+        snap = json.load(open(cfg["file"]))
+        snap["source"] = "repo"
+        return snap
+    n_cls = pd.Series(CLASS).value_counts()
+    holdings = {}
+    for i in INSTRUMENTS:
+        w = cfg["alloc"][i["cls"]] / n_cls[i["cls"]]
+        ep = entry_price(i["name"])
+        holdings[i["name"]] = dict(weight=w, entry_price=ep, units=round(w * CORPUS / ep, 4),
+                                   entry_date=str(INVEST_DATE.date()))
+    snap = dict(persona=persona, created=str(pd.Timestamp.today().date()),
+                corpus=CORPUS, holdings=holdings, source="autosave")
+    try:
+        json.dump(snap, open(cfg["file"], "w"), indent=2)
+    except Exception:
+        pass
+    return snap
+
+
+snaps = {p: get_snapshot(p) for p in PERSONAS}
+
+
+def valuation(persona):
+    h = snaps[persona]["holdings"]
+    rows = []
+    for i in INSTRUMENTS:
+        n = i["name"]
+        u, ep, cur = h[n]["units"], h[n]["entry_price"], float(last[n])
+        d = float(divs.get(n, pd.Series(dtype=float)).loc[:TODAY].sum()) * u if n in divs else 0.0
+        acc = u * 100 * i["income"] * (TODAY - INVEST_DATE).days / 365 if i["ticker"] is None else 0.0
+        rows.append(dict(Name=n, Class=i["cls"], Sector=i["sector"], Units=u, Entry=ep, Current=cur,
+                         Invested=u * ep, MarketValue=u * cur, Dividends=d, Accrued=acc,
+                         Total=u * cur + d + acc))
+    df = pd.DataFrame(rows).set_index("Name")
+    df["Weight"] = df["Total"] / df["Total"].sum()
+    df["P&L"] = df["Total"] - df["Invested"]
+    return df
+
+
+vals = {p: valuation(p) for p in PERSONAS}
+tot = {p: vals[p]["Total"].sum() for p in PERSONAS}
+
+# ============================================================== STATS / OPTIMISER
+rets = prices.pct_change().iloc[1:].copy()
+rets[GSEC["name"]] = GSEC["income"] / TD
+mkt = bench.pct_change().dropna()
+
+
+@st.cache_data(ttl=3600)
+def stats(rf, key):
+    mu = (rets.mean() * TD).clip(-0.10, 0.35)
+    mu[GSEC["name"]] = GSEC["income"]
+    vol = rets.std() * np.sqrt(TD)
+    cov = rets.cov().fillna(0) * TD
+    cov += np.eye(len(cov)) * 1e-8
+    beta = rets.apply(lambda c: c.cov(mkt) / mkt.var() if c.name != GSEC["name"] else 0.0)
+    return mu, vol, cov, beta
+
+
+with st.sidebar:
+    st.header("Controls")
+    persona = st.radio("Investor persona", list(PERSONAS), index=1)
+    rf = st.number_input("Risk-free rate (% p.a.)", 0.0, 20.0, 6.5, 0.1) / 100
+    if st.button("🔄 Refresh market data"):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption(f"Latest data: {TODAY.date()}")
+
+mu, vol, cov, beta = stats(rf, str(TODAY))
+mkt_ret = mkt.mean() * TD if len(mkt) else 0.12
+
+
+@st.cache_data(ttl=3600)
+def optimise(p, rf_, mu_, cov_):
+    cfg = PERSONAS[p]
+    w0 = np.array([snaps[p]["holdings"][n]["weight"] for n in NAMES])
+    cls = np.array([CLASS[n] for n in NAMES])
+    cons = [{"type": "eq", "fun": lambda w: w.sum() - 1}]
+    for c, (lo, hi) in cfg["bands"].items():
+        m = cls == c
+        cons.append({"type": "ineq", "fun": lambda w, m=m, lo=lo: w[m].sum() - lo})
+        cons.append({"type": "ineq", "fun": lambda w, m=m, hi=hi: hi - w[m].sum()})
+    m_, c_ = mu_.reindex(NAMES).values, cov_.reindex(index=NAMES, columns=NAMES).values
+    f = lambda w: -(w @ m_ - rf_) / np.sqrt(w @ c_ @ w + 1e-12)
+    r = minimize(f, w0, bounds=[(0, MAX_WEIGHT)] * len(NAMES), constraints=cons, method="SLSQP")
+    w = r.x if r.success else w0
+    return pd.Series(np.clip(w, 0, None) / np.clip(w, 0, None).sum(), index=NAMES)
+
+
+rec_w = optimise(persona, rf, mu, cov)
+rec_ret = float(rec_w @ mu.reindex(NAMES))
+rec_vol = float(np.sqrt(rec_w.values @ cov.reindex(index=NAMES, columns=NAMES).values @ rec_w.values))
+
+cfg = PERSONAS[persona]
+target = cfg["target"]
+yrs_total = (TARGET_DATE - INVEST_DATE).days / 365
+yrs_left = max((TARGET_DATE - TODAY).days / 365, 0.01)
+cur_val = tot[persona]
+need = (target / cur_val) ** (1 / yrs_left) - 1
+proj = cur_val * (1 + rec_ret) ** yrs_left
+req_from_inception = (target / CORPUS) ** (1 / yrs_total) - 1
+max_ach = CORPUS * (1 + rec_ret) ** yrs_total
+pnl = cur_val - CORPUS
+
+# ============================================================== HEADER
+c1, c2 = st.columns([2.1, 1])
+with c1:
+    st.markdown(f"""<div class='card'><div class='eyebrow'>Live portfolio · as of {TODAY.strftime('%d %b %Y')} ·
+    invested {INVEST_DATE.strftime('%d %b %Y')} · {LOOKBACK_YEARS}Y lookback</div>
+    <h1 style='margin:4px 0'>{len(INSTRUMENTS)}-Asset Allocation Terminal</h1>
+    <div>{cr(CORPUS)} simulated on {INVEST_DATE.strftime('%d %b %Y')} across
+    {sum(c=='Equity' for c in CLASS.values())} equities, {sum(c=='Debt' for c in CLASS.values())} bonds, Gold ETF and Silver ETF.
+    This view uses the frozen <b style='color:{GOLD}'>{persona}</b> allocation; each investor profile has its own
+    starting units and current market valuation.</div></div>""", unsafe_allow_html=True)
+with c2:
+    col = GREEN if pnl >= 0 else RED
+    st.markdown(f"""<div class='card' style='text-align:right'><div class='val' style='font-size:2.6rem'>{cr(cur_val)}</div>
+    <div class='lbl'>Current portfolio value at {TODAY.strftime('%d %b %Y')}</div>
+    <div class='sub' style='color:{col}'>P&L since {INVEST_DATE.strftime('%d %b %Y')}: {sgn(pnl, lakh)} ({pnl/CORPUS*100:.2f}%)</div></div>""",
+                unsafe_allow_html=True)
+
+if any(s["source"] == "autosave" for s in snaps.values()):
+    st.markdown("<div class='warn'>One or more persona snapshots exist only as local autosaves and may be lost when the "
+                "hosting container restarts. Download and commit the files below to the repository root to preserve all "
+                "three simulated portfolios.</div>", unsafe_allow_html=True)
+with st.expander("Inception snapshots for all three personas", expanded=True):
+    cols = st.columns(3)
+    for col_, (p, s) in zip(cols, snaps.items()):
+        col_.markdown(f"**{p}** · {PERSONAS[p]['file']} · created {s['created']} · {s['source']}")
+        col_.download_button(f"Download {p}", json.dumps(s, indent=2), PERSONAS[p]["file"], key=f"dl_{p}",
+                             use_container_width=True)
+
+# ============================================================== PERSONA VALUE CARDS
+st.markdown("## Current Portfolio Value by Persona")
+st.caption(f"Each portfolio starts with {cr(CORPUS)} on {INVEST_DATE.strftime('%d %b %Y')} and uses that persona's frozen "
+           "asset allocation. Values include latest available prices, counted dividend entitlements and modelled G-Sec coupon accrual.")
+for col_, p in zip(st.columns(3), PERSONAS):
+    pl = tot[p] - CORPUS
+    col_.markdown(card(p, cr(tot[p]), f"P&L: {sgn(pl, lakh)} ({pl/CORPUS*100:.2f}%)", GREEN if pl >= 0 else RED),
+                  unsafe_allow_html=True)
+
+k = st.columns(5)
+risk = "At risk" if need > rec_ret else "On track"
+k[0].markdown(card("Current Portfolio Value", cr(cur_val)), unsafe_allow_html=True)
+k[1].markdown(card("Investor Target", cr(target)), unsafe_allow_html=True)
+k[2].markdown(card("CAGR Needed From Today", f"{need*100:.2f}%", risk, RED if need > rec_ret else GREEN), unsafe_allow_html=True)
+k[3].markdown(card("Recommended Portfolio Return", f"{rec_ret*100:.2f}%", "Selected persona · optimized recommendation", GREEN), unsafe_allow_html=True)
+gap = proj - target
+k[4].markdown(card("Projected Value at Target Date", cr(proj),
+                   f"₹{abs(gap):,.0f} {'below' if gap < 0 else 'above'} target", RED if gap < 0 else GREEN), unsafe_allow_html=True)
+
+st.info(f"**Investment date** {INVEST_DATE.strftime('%d %b %Y')} (fixed) · **Current valuation date** {TODAY.strftime('%d %b %Y')} "
+        f"(latest market data) · **Target date** {TARGET_DATE.strftime('%d %b %Y')} (fixed) · **Remaining horizon** "
+        f"{yrs_left:.2f} years ({(TARGET_DATE-TODAY).days} days). Prices can be intraday while the market is open.")
+
+a, b = st.columns([1.6, 1])
+a.markdown(f"<div class='card'><div class='eyebrow'>Live {yrs_total:.0f}-year projection</div><div class='val' style='font-size:2.6rem'>{cr(proj)}</div>"
+           f"<div class='lbl'>Estimated portfolio value on {TARGET_DATE.strftime('%d %b %Y')} using the selected persona's recommended annual return. "
+           "This is a model estimate, not a guarantee.</div></div>", unsafe_allow_html=True)
+b.markdown(f"<div class='card'><div class='eyebrow'>Projected gain by target date</div><div class='val' style='font-size:2.6rem'>{lakh(proj-cur_val)}</div>"
+           f"<div class='lbl'>Modelled gain of {(proj/cur_val-1)*100:.2f}% from today's {cr(cur_val)} over the remaining horizon.</div></div>",
+           unsafe_allow_html=True)
+
+v = vals[persona]
+st.caption(f"Inception reconciliation: units × entry prices = ₹{v['Invested'].sum():,.0f} vs ₹{CORPUS:,.0f} invested "
+           f"(difference ₹{v['Invested'].sum()-CORPUS:,.0f}) across {len(v)} instruments. Market value ₹{v['MarketValue'].sum():,.0f} + "
+           f"dividends ₹{v['Dividends'].sum():,.0f} + G-Sec accrued coupon ₹{v['Accrued'].sum():,.0f} = ₹{cur_val:,.0f}.")
+with st.expander("Data integrity: entry prices & current prices per instrument"):
+    st.dataframe(v[["Units", "Entry", "Current", "Invested", "MarketValue"]].round(2), use_container_width=True)
+
+if req_from_inception > rec_ret:
+    st.markdown(f"<div class='warn'>Current recommendation: the {persona} target of {cr(target)} is not feasible from inception under the "
+                f"current assumptions and risk guardrails. A fresh optimization would show a maximum achievable outcome of {cr(max_ach)}.</div>",
+                unsafe_allow_html=True)
+st.markdown(f"<div class='warn'>Live target check using the selected persona's recommendation: current portfolio value is {cr(cur_val)}. "
+            f"With {yrs_left:.2f} years remaining until {TARGET_DATE.strftime('%d %b %Y')}, the portfolio needs {need*100:.2f}% CAGR from today "
+            f"to reach the fixed {cr(target)} target, versus a recommended return of {rec_ret*100:.2f}%. "
+            f"The target is currently {risk.lower()}.</div>", unsafe_allow_html=True)
+
+for col_, p in zip(st.columns(3), PERSONAS):
+    c_ = PERSONAS[p]
+    bd = c_["bands"]
+    txt = " · ".join(f"{k_.lower()} {lo*100:.0f}%–{hi*100:.0f}%" for k_, (lo, hi) in bd.items())
+    col_.markdown(card(p.upper(), cr(c_["target"]), f"target CAGR {((c_['target']/CORPUS)**(1/yrs_total)-1)*100:.2f}% · {txt}",
+                       cls="sel" if p == persona else ""), unsafe_allow_html=True)
+
+# ============================================================== EXPLORER
+st.markdown("## Investment Explorer")
+st.caption("Select an instrument to update the detailed view, metrics and charts.")
+choice = st.selectbox("Choose an investment", NAMES)
+inf = next(i for i in INSTRUMENTS if i["name"] == choice)
+row = v.loc[choice]
+m = st.columns(5)
+m[0].metric("Current Price", f"₹{row['Current']:,.2f}")
+m[1].metric("Original Weight (locked)", f"{snaps[persona]['holdings'][choice]['weight']*100:.2f}%")
+m[2].metric(f"Recommended Weight · {persona}", f"{rec_w[choice]*100:.2f}%")
+m[3].metric("Recommended Allocation", lakh(rec_w[choice] * CORPUS))
+m[4].metric("Persona Portfolio Value", lakh(row["Total"]))
+t1, t2 = st.columns([1, 1.5])
+dchg = (last[choice] / prev[choice] - 1) * 100
+tbl = pd.DataFrame({"Metric": ["Asset Class", "Market Cap", "Sector / Exposure", "Entry Price", "Entry Price Date", "Cap Category",
+                               "Current Price Date", "Units (fixed)", "Daily Price Change", "Dividend Earned / Entitled",
+                               "Annualised Volatility", "Beta vs Nifty"],
+                    "Value": [inf["cls"], f"₹{caps[choice]:,.0f} Cr" if pd.notna(caps[choice]) else "n/a", inf["sector"],
+                              f"₹{row['Entry']:.2f}", str(INVEST_DATE.date()), inf["cap"], str(TODAY.date()),
+                              f"{row['Units']:.4f}", f"{dchg:+.2f}%", f"₹{row['Dividends']:,.0f}",
+                              f"{vol[choice]*100:.1f}%", f"{beta[choice]:.2f}"]})
+t1.dataframe(tbl, hide_index=True, use_container_width=True, height=440)
+ph = prices[choice].dropna()
+fig = go.Figure(go.Scatter(x=ph.index, y=ph.values, name=choice, line=dict(color=GOLD)))
+fig.add_trace(go.Scatter(x=[INVEST_DATE], y=[row["Entry"]], mode="markers", name="Entry", marker=dict(size=11, color=TEAL)))
+fig.update_layout(title=f"{choice} — price history", yaxis_title="Price (₹)", height=440, plot_bgcolor="white")
+t2.plotly_chart(fig, use_container_width=True)
+
+# ============================================================== TABS
+tabs = st.tabs(["Overview", "Holdings", "Recommendation", "Risk & Return", "Historical Trends"])
+
+with tabs[0]:
+    l, r = st.columns(2)
+    by_cls = rec_w.groupby(pd.Series(CLASS)).sum()
+    cnt = pd.Series(CLASS).value_counts()
+    labels = [f"{c} ({cnt[c]})" if c in ("Equity", "Debt") else c for c in by_cls.index]
+    d = go.Figure(go.Pie(labels=labels, values=by_cls.values, hole=.55, textinfo="label+percent",
+                         marker=dict(colors=[GOLD, TEAL, "#9b7653", "#8f98a8"])))
+    d.update_layout(title=f"Recommended Asset-Class Allocation · {persona}", showlegend=False, height=420,
+                    annotations=[dict(text=f"{cr(CORPUS)}<br>recommended", showarrow=False)])
+    l.plotly_chart(d, use_container_width=True)
+    t = np.linspace(0, yrs_total, 7)
+    el = (TODAY - INVEST_DATE).days / 365
+    tr = go.Figure()
+    tt = np.linspace(el, yrs_total, 6)
+    tr.add_trace(go.Scatter(x=tt, y=cur_val * (1 + rec_ret) ** (tt - el), mode="lines+markers",
+                            name=f"Selected Persona Projection ({rec_ret*100:.2f}%)", line=dict(color=GOLD)))
+    tr.add_trace(go.Scatter(x=t, y=CORPUS * (1 + req_from_inception) ** t, mode="lines",
+                            name=f"Target Required ({req_from_inception*100:.2f}%)", line=dict(color="#555", dash="dash")))
+    tr.add_trace(go.Scatter(x=[el], y=[cur_val], mode="markers", name="Current Portfolio Value",
+                            marker=dict(size=12, color=TEAL)))
+    tr.update_layout(title="Target vs Expected Trajectory", xaxis_title=f"Years elapsed since {INVEST_DATE.strftime('%d %b %Y')}",
+                     yaxis_title="Portfolio value (₹)", height=420, plot_bgcolor="white", legend=dict(orientation="h", y=1.15))
+    r.plotly_chart(tr, use_container_width=True)
+
+    st.markdown("### Return Composition")
+    st.caption("Annualised weighted contribution (current market-value weights) from capital gains and income sources.")
+    w = v["Weight"]
+    eq = [n for n in NAMES if CLASS[n] == "Equity"]
+    gl = [n for n in NAMES if CLASS[n] == "Gold"]
+    sv = [n for n in NAMES if CLASS[n] == "Silver"]
+    divy = pd.Series({n: (divs[n].sum() / entry_price(n) * 365 / max((TODAY - INVEST_DATE).days, 1)) if n in divs else 0
+                      for n in NAMES})
+    comp = pd.DataFrame({"Component": ["Equity capital gains", "Equity dividends", "Bond interest",
+                                       "Gold appreciation", "Silver appreciation"],
+                         "Contribution": [(w[eq] * mu[eq]).sum(), (w[eq] * divy[eq]).sum(),
+                                          sum(w[i["name"]] * i["income"] for i in INSTRUMENTS if "income" in i),
+                                          (w[gl] * mu[gl]).sum(), (w[sv] * mu[sv]).sum()]})
+    bar = px.bar(comp, x="Contribution", y="Component", orientation="h",
+                 text=comp["Contribution"].map("{:.2%}".format), color_discrete_sequence=[TEAL])
+    bar.update_layout(xaxis_tickformat=".1%", xaxis_title="Weighted annual return contribution",
+                      yaxis_title="", plot_bgcolor="white", height=340)
+    st.plotly_chart(bar, use_container_width=True)
+
+with tabs[1]:
+    h = v.copy()
+    st.dataframe(h[["Class", "Sector", "Units", "Entry", "Current", "Invested", "MarketValue", "Dividends",
+                    "Accrued", "Total", "Weight", "P&L"]]
+                 .style.format({"Units": "{:.2f}", "Entry": "{:.2f}", "Current": "{:.2f}", "Invested": "₹{:,.0f}",
+                                "MarketValue": "₹{:,.0f}", "Dividends": "₹{:,.0f}", "Accrued": "₹{:,.0f}",
+                                "Total": "₹{:,.0f}", "Weight": "{:.2%}", "P&L": "₹{:,.0f}"}),
+                 use_container_width=True)
+    st.plotly_chart(px.bar(h.reset_index(), x="Name", y="P&L", color="Class", title="P&L by holding (₹)"),
+                    use_container_width=True)
+
+with tabs[2]:
+    cmp_ = pd.DataFrame({"Original (locked) %": [snaps[persona]["holdings"][n]["weight"] * 100 for n in NAMES],
+                         "Recommended %": rec_w.values * 100,
+                         "Recommended ₹": rec_w.values * CORPUS}, index=NAMES)
+    cmp_["Change (pp)"] = cmp_["Recommended %"] - cmp_["Original (locked) %"]
+    st.dataframe(cmp_.round(2), use_container_width=True)
+    st.plotly_chart(px.bar(cmp_.reset_index(), x="index", y=["Original (locked) %", "Recommended %"], barmode="group"),
+                    use_container_width=True)
+    st.caption(f"Max-Sharpe optimisation with {persona} asset-class bands and a {MAX_WEIGHT:.0%} per-instrument cap. "
+               f"Expected return {rec_ret*100:.2f}%, volatility {rec_vol*100:.2f}%, Sharpe {(rec_ret-rf)/rec_vol:.2f}. "
+               "Inputs are historical means (clipped to −10%…35%) — a model estimate, not a forecast.")
+
+with tabs[3]:
+    rr = pd.DataFrame({"Class": pd.Series(CLASS), "Return %": mu * 100, "Volatility %": vol * 100, "Beta": beta})
+    rr["CAPM %"] = (rf + rr["Beta"] * (mkt_ret - rf)) * 100
+    rr["Alpha %"] = rr["Return %"] - rr["CAPM %"]
+    rr["Sharpe"] = (rr["Return %"] / 100 - rf) / (rr["Volatility %"] / 100).replace(0, np.nan)
+    st.dataframe(rr.round(2), use_container_width=True)
+    wcur = v["Weight"].reindex(NAMES).values
+    p_vol = float(np.sqrt(wcur @ cov.reindex(index=NAMES, columns=NAMES).values @ wcur))
+    p_ret = float(wcur @ mu.reindex(NAMES).values)
+    p_beta = float(wcur @ beta.reindex(NAMES).values)
+    q = st.columns(4)
+    q[0].metric("Portfolio return (hist.)", f"{p_ret*100:.2f}%")
+    q[1].metric("Portfolio volatility", f"{p_vol*100:.2f}%")
+    q[2].metric("Portfolio beta", f"{p_beta:.2f}")
+    q[3].metric("Portfolio Sharpe", f"{(p_ret-rf)/p_vol:.2f}")
+    sc = px.scatter(rr.reset_index(), x="Volatility %", y="Return %", text="index", color="Class", title="Risk vs return")
+    sc.update_traces(textposition="top center")
+    st.plotly_chart(sc, use_container_width=True)
+    xs = np.linspace(0, max(1.5, float(beta.max()) + .2), 30)
+    sml = go.Figure(go.Scatter(x=xs, y=(rf + xs * (mkt_ret - rf)) * 100, name="SML"))
+    sml.add_trace(go.Scatter(x=rr["Beta"], y=rr["Return %"], mode="markers+text", text=rr.index,
+                             textposition="top center", name="Assets"))
+    sml.update_layout(title="Security Market Line", xaxis_title="Beta", yaxis_title="Return %")
+    st.plotly_chart(sml, use_container_width=True)
+
+with tabs[4]:
+    sel = st.multiselect("Compare instruments", NAMES, default=NAMES[:5])
+    if sel:
+        nd = prices[sel].dropna(how="all")
+        nd = nd / nd.bfill().iloc[0] * 100
+        st.plotly_chart(px.line(nd, title="Rebased to 100 (5Y)"), use_container_width=True)
+    hist = (prices.loc[INVEST_DATE:] * vals[persona]["Units"].reindex(NAMES)).sum(axis=1)
+    if len(hist):
+        st.plotly_chart(px.line(hist, title=f"{persona} portfolio value since inception (price only, ₹)"),
+                        use_container_width=True)
+    st.plotly_chart(px.imshow(rets.drop(columns=[GSEC["name"]]).corr().round(2), text_auto=True,
+                              color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title="Correlation matrix", aspect="auto"),
+                    use_container_width=True)
+
+# ============================================================== DAILY MOVEMENT + DIVIDENDS
+st.info(f"The investment is assumed to be initiated on {INVEST_DATE.strftime('%d %b %Y')}. Holdings (units) are fixed at their entry prices "
+        "and never change; each refresh re-marks those holdings to the latest market price and adds dividends whose ex-date has passed.")
+st.markdown("## Daily Market Movement")
+dm = pd.DataFrame({"Name": NAMES, "Market Cap (₹ Cr)": [caps.get(n) for n in NAMES], "Current Price": last[NAMES].values,
+                   "₹ Change": (last - prev)[NAMES].values, "Daily Change": ((last / prev - 1) * 100)[NAMES].values})
+st.dataframe(dm.sort_values("Daily Change", ascending=False), hide_index=True, use_container_width=True,
+             column_config={"Market Cap (₹ Cr)": st.column_config.NumberColumn(format="₹%.0f"),
+                            "Current Price": st.column_config.NumberColumn(format="₹%.2f"),
+                            "₹ Change": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Daily Change": st.column_config.NumberColumn(format="%.2f%%")})
+
+ev = []
+for n, s in divs.items():
+    for ex, amt in s.items():
+        ev.append({"Company": n, "Dividend / Share": amt, "Ex-Date": ex.date(),
+                   "Dividend Earned / Entitlement": amt * snaps[persona]["holdings"][n]["units"] if ex <= TODAY else 0.0,
+                   "Status": "Entitled / return accrued" if ex <= TODAY else "Upcoming", "Source": "Yahoo Finance"})
+earned = sum(e["Dividend Earned / Entitlement"] for e in ev)
+st.markdown(f"## Dividend Tracker · ₹{earned:,.0f} earned/entitled")
+st.caption("Dividend events with an ex-date after the investment date, valued on the selected persona's units. "
+           "Only events whose ex-date has passed are counted in portfolio value; later ones are listed as upcoming.")
+if ev:
+    st.dataframe(pd.DataFrame(ev).sort_values("Ex-Date", ascending=False), hide_index=True, use_container_width=True)
+else:
+    st.write("No dividend events since the investment date.")
+st.caption("Educational/simulation dashboard. Each persona's holdings (units) are fixed from the entry prices and stored in a separate "
+           "snapshot; current value is marked to the latest available trading price. Historical CAGR, beta and CAPM metrics are model "
+           "estimates. The G-Sec is carried at indicative par with a modelled accrued coupon. Data: Yahoo Finance.")
